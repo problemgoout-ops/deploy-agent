@@ -863,6 +863,69 @@ fi
 rm -rf "$TEST_ROOT"
 
 # ─────────────────────────────────────────
+# Test Suite 15: Cloud-only стратегия (без локальных чат-моделей)
+# ─────────────────────────────────────────
+echo ""
+echo "─── Suite 15: Cloud-only стратегия ───"
+
+# Test 15.1: Нет упоминаний qwen2.5 и llama3.3 как устанавливаемых моделей
+echo "Test 15.1: No local chat models in install steps..."
+LOCAL_MODELS=0
+for model in "qwen2.5:7b" "qwen2.5:14b" "llama3.3:8b" "llama3.3"; do
+  if grep -q "ollama pull $model" "$SKILL_FILE" 2>/dev/null; then
+    LOCAL_MODELS=$((LOCAL_MODELS + 1))
+  fi
+done
+if [ "$LOCAL_MODELS" -eq 0 ]; then
+  echo "  ✅ PASS: Нет ollama pull для локальных чат-моделей"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Найдено $LOCAL_MODELS локальных чат-моделей для скачивания"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 15.2: nomic-embed-text упоминается как единственная локальная
+echo "Test 15.2: nomic-embed-text is the only local model..."
+if grep -qP 'Единственная локальная модель|only local model' "$SKILL_FILE"; then
+  echo "  ✅ PASS: nomic-embed-text указана как единственная локальная"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Не указано что nomic-embed-text единственная"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 15.3: Cloud-only упоминается как стратегия по умолчанию
+echo "Test 15.3: Cloud-only is default strategy..."
+if grep -q 'По умолчанию.*cloud-only' "$SKILL_FILE"; then
+  echo "  ✅ PASS: Cloud-only указана как стратегия по умолчанию"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Cloud-only не указана как дефолтная стратегия"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 15.4: Нет таблицы локальных моделей для чата
+echo "Test 15.4: No local chat model table..."
+# Проверяем что нет строки "Модель | RAM | Размер" в контексте локальных чат-моделей
+if grep -qP 'qwen.*GB.*Лёгкая|llama.*GB.*Универсальная' "$SKILL_FILE"; then
+  echo "  ❌ FAIL: Найдена таблица локальных чат-моделей"
+  FAIL=$((FAIL+1))
+else
+  echo "  ✅ PASS: Таблица локальных чат-моделей удалена"
+  PASS=$((PASS+1))
+fi
+
+# Test 15.5: Требования к RAM обновлены (нет qwen/llama в таблице)
+echo "Test 15.5: RAM requirements updated (no local models)..."
+if grep -qP 'qwen.*RAM.*GB' "$SKILL_FILE"; then
+  echo "  ❌ FAIL: В таблице RAM всё ещё есть qwen"
+  FAIL=$((FAIL+1))
+else
+  echo "  ✅ PASS: Таблица RAM без локальных моделей"
+  PASS=$((PASS+1))
+fi
+
+# ─────────────────────────────────────────
 # Итоги
 # ─────────────────────────────────────────
 echo ""

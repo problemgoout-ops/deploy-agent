@@ -1,6 +1,6 @@
 ---
 name: deploy-agent
-description: "Развёртывание OpenClaw-агента на чистом сервере 'под ключ': SSH, Node.js, OpenClaw, Ollama, эмбеддинги, память, Telegram-бот, fallback-модели, базовые скиллы (Agent Doctor, Agent Forge, ru-text). Triggers: 'разверни агента', 'deploy agent', 'подними бота', 'новый краб', 'краб', 'настрой сервер', 'установи OpenClaw', 'создай бота на сервере', 'разверни на сервере'."
+description: "Развёртывание OpenClaw-агента на чистом сервере 'под ключ': SSH, Node.js, OpenClaw, Ollama, эмбеддинги (nomic-embed-text), память, Telegram-бот, cloud-модели (deepseek, glm, kimi), базовые скиллы (Agent Doctor, Agent Forge, ru-text). Cloud-only стратегия по умолчанию — локальные чат-модели не ставятся. Triggers: 'разверни агента', 'deploy agent', 'подними бота', 'новый краб', 'краб', 'настрой сервер', 'установи OpenClaw', 'создай бота на сервере', 'разверни на сервере'."
 ---
 
 # Deploy Agent 🦀
@@ -393,9 +393,13 @@ openclaw gateway status
 
 ---
 
-## Часть 3: Ollama + локальные модели + эмбеддинги
+## Часть 3: Ollama + эмбеддинги
 
 ### Шаг 7: Установка Ollama
+
+Ollama нужна для эмбеддингов (`nomic-embed-text`) — без них не работает `memory_search` (семантический поиск по памяти).
+
+Чат-модели используются облачные, локально не скачиваются. Это экономит 5-10 GB RAM и диска.
 
 ```bash
 # Linux
@@ -416,28 +420,10 @@ sudo systemctl start ollama
 ollama serve
 ```
 
-### Шаг 8: Скачивание моделей
+### Шаг 8: Скачать nomic-embed-text (обязательно)
 
-**Для чата (выбрать одну):**
+**Единственная локальная модель.** Без неё `memory_search` не работает.
 
-| Модель | RAM | Размер | Когда |
-|--------|-----|--------|-------|
-| `qwen2.5:7b` | 8 GB | 4.7 GB | Лёгкая, быстрая |
-| `qwen2.5:14b` | 16+ GB | 9 GB | Мощнее |
-| `llama3.3:8b` | 8 GB | 4.9 GB | Универсальная |
-
-```bash
-# Лёгкая и быстрая (4.7 GB) — для машин с 8 GB RAM
-ollama pull qwen2.5:7b
-
-# Мощнее (9 GB) — для машин с 16+ GB RAM
-ollama pull qwen2.5:14b
-
-# Быстрая универсальная (4.9 GB)
-ollama pull llama3.3:8b
-```
-
-**Для эмбеддингов (обязательно):**
 ```bash
 ollama pull nomic-embed-text
 ```
@@ -445,51 +431,24 @@ ollama pull nomic-embed-text
 Проверить:
 ```bash
 ollama list
+# Должен быть: nomic-embed-text:latest
 ```
 
-### Шаг 9: Настройка провайдера Ollama в OpenClaw
+**Локальные чат-модели НЕ скачиваем.** Используем cloud-only стратегию — все чат-модели через Ollama Cloud API.
+
+### Шаг 9: Настройка Ollama в OpenClaw
 
 Добавить в `~/.openclaw/openclaw.json` → `models.providers`:
 
 ```json
 "ollama": {
   "baseUrl": "http://127.0.0.1:11434",
-  "api": "ollama",
-  "apiKey": "{OLLAMA_API_KEY}",
-  "models": [
-    {
-      "id": "qwen2.5:14b",
-      "name": "Qwen 2.5 14B (Local)",
-      "api": "ollama",
-      "input": ["text"],
-      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-      "contextWindow": 131072,
-      "maxTokens": 8192
-    }
-  ]
+  "api": "ollama"
 }
 ```
 
-**⚠️ ВАЖНО: `apiKey` в провайдере Ollama обязателен для cloud-моделей!**
-Без него OpenClaw не сможет передавать ключ в API-запросы к Ollama, и cloud-модели будут возвращать 401.
-
-**Замени `qwen2.5:14b` на ту модель, которую скачал.**
-
-**Для cloud-only стратегии** (только облачные модели, без локальных):
-```json
-"ollama": {
-  "api": "ollama",
-  "baseUrl": "http://127.0.0.1:11434",
-  "apiKey": "{OLLAMA_API_KEY}"
-}
-```
-
-Добавить алиас в `agents.defaults.models`:
-```json
-"ollama/qwen2.5:14b": {
-  "alias": "QWEN-LOCAL"
-}
-```
+**⚠️ API-ключ Ollama Cloud** — обязательно добавить в настройки cloud-провайдера (см. Часть 6).
+Без ключа cloud-модели возвращают 401.
 
 ---
 
@@ -812,15 +771,6 @@ ls ~/.openclaw/agents/{agent_id}/sessions/
 }
 ```
 
-**Если владелец явно хочет локальную fallback-модель** (требует RAM и диск):
-```json
-"model": {
-  "primary": "ollama/deepseek-v4-pro:cloud",
-  "fallbacks": ["ollama/qwen2.5:7b"]
-}
-```
-Смотри Часть 8 для проверки ресурсов ПЕРЕД установкой локальных моделей.
-
 ---
 
 ## Чеклист установки
@@ -830,8 +780,7 @@ ls ~/.openclaw/agents/{agent_id}/sessions/
 - [ ] Node.js установлен (v24+)
 - [ ] OpenClaw установлен и gateway запущен
 - [ ] Ollama установлена и работает
-- [ ] Модель для чата скачана (`ollama list`)
-- [ ] `nomic-embed-text` скачан для эмбеддингов
+- [ ] `nomic-embed-text` скачан для эмбеддингов (`ollama list | grep nomic`)
 - [ ] `memorySearch` настроен в `openclaw.json`
 - [ ] Структура памяти создана (memory/*.md, MEMORY.md, memory/contract.md)
 - [ ] Telegram-токен получен от @BotFather
@@ -928,24 +877,21 @@ nproc
 
 | Свободно RAM | Что ставить |
 |---------------|-------------|
-| < 2 GB | Только nomic-embed-text (274 MB RAM). Чат — только cloud. |
-| 2-4 GB | nomic-embed-text. Чат — только cloud. |
-| 4-8 GB | nomic-embed-text + qwen2.5:7b (если нужен fallback) |
-| 8+ GB | nomic-embed-text + qwen2.5:14b (если нужен fallback) |
+| < 2 GB | Только nomic-embed-text (274 MB). Cloud-only для чата. |
+| 2-4 GB | nomic-embed-text. Cloud-only для чата. Комфортно. |
+| 4+ GB | nomic-embed-text + запас для пиковой нагрузки. |
 
 | Свободно диска | Что ставить |
 |----------------|-------------|
-| < 5 GB | Только nomic-embed-text (274 MB). Предупредить владельца. |
-| 5-15 GB | nomic-embed-text. Чат-модель — только если хватает. |
-| 15+ GB | Полная установка с моделью. |
+| < 2 GB | Только nomic-embed-text (274 MB). Предупредить владельца что места мало. |
+| 2-5 GB | nomic-embed-text. Cloud-only для чата. |
+| 5+ GB | nomic-embed-text + комфортный запас для логов и данных. |
 
-**Если ресурсов мало — предупредить владельца перед установкой.**
-
-**Стратегия cloud-only (без локальных моделей чата):**
-- Установить ТОЛЬКО `nomic-embed-text` для memorySearch
-- Чат-модели не ставить — использовать только cloud
+**Cloud-only стратегия — по умолчанию для всех:**
+- Установить ТОЛЬКО `nomic-embed-text` для memory_search (274 MB)
+- Чат-модели НЕ ставить локально — использовать Ollama Cloud API
 - Это экономит 5-10 GB диска и 4-9 GB RAM
-- Требует стабильного интернета на сервере
+- Работает даже на серверах с 2 GB RAM (как у Анны до апгрейда)
 
 ---
 
