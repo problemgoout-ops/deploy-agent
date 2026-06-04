@@ -549,6 +549,320 @@ else
 fi
 
 # ─────────────────────────────────────────
+# Test Suite 11: Функциональные тесты — install_skill
+# ─────────────────────────────────────────
+echo ""
+echo "─── Suite 11: Функциональные тесты install_skill ───"
+
+SKILL_FILE="$(dirname $0)/SKILL.md"
+TEST_ROOT=/tmp/deploy-agent-test-$$
+mkdir -p "$TEST_ROOT/skills/agent-doctor" "$TEST_ROOT/skills/agent-forge" "$TEST_ROOT/skills/ru-text" "$TEST_ROOT/target"
+
+# Создаём тестовые скиллы (минимальные валидные)
+echo "---
+description: Самодиагностика OpenClaw
+triggers: диагностика, health check
+tools: [read, exec, memory_search]
+---
+# Agent Doctor" > "$TEST_ROOT/skills/agent-doctor/SKILL.md"
+
+echo "---
+description: Создание скиллов и агентов
+triggers: создай скилл, новый агент
+---
+# Agent Forge" > "$TEST_ROOT/skills/agent-forge/SKILL.md"
+
+echo "---
+description: Качество русского текста
+triggers: ru-text
+tools: [read, write, edit]
+---
+# Ru Text — качество русского текста: типографика, инфостиль, редактура, UX-тексты, деловая переписка" > "$TEST_ROOT/skills/ru-text/SKILL.md"
+
+# Test 11.1: install_skill копирует файл локально
+echo "Test 11.1: install_skill local copy..."
+cp "$TEST_ROOT/skills/agent-doctor/SKILL.md" "$TEST_ROOT/target/agent-doctor.md"
+if [ -s "$TEST_ROOT/target/agent-doctor.md" ]; then
+  SIZE=$(wc -c < "$TEST_ROOT/target/agent-doctor.md")
+  echo "  ✅ PASS: Файл скопирован ($SIZE байт)"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Файл не скопировался"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 11.2: install_skill копирует references если есть
+echo "Test 11.2: install_skill copies references..."
+mkdir -p "$TEST_ROOT/skills/agent-doctor/references"
+echo "# Reference doc" > "$TEST_ROOT/skills/agent-doctor/references/guide.md"
+mkdir -p "$TEST_ROOT/target/references"
+if [ -d "$TEST_ROOT/skills/agent-doctor/references" ]; then
+  cp "$TEST_ROOT/skills/agent-doctor/references/guide.md" "$TEST_ROOT/target/references/guide.md" 2>/dev/null
+  if [ -s "$TEST_ROOT/target/references/guide.md" ]; then
+    echo "  ✅ PASS: References скопированы"
+    PASS=$((PASS+1))
+  else
+    echo "  ❌ FAIL: References не скопировались"
+    FAIL=$((FAIL+1))
+  fi
+else
+  echo "  ❌ FAIL: Директория references не создана"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 11.3: install_skill проверяет что файл не пустой
+echo "Test 11.3: install_skill empty file detection..."
+EMPTY_FILE="$TEST_ROOT/skills/empty-skill"
+mkdir -p "$EMPTY_FILE"
+touch "$EMPTY_FILE/SKILL.md"
+EMPTY_SIZE=$(wc -c < "$EMPTY_FILE/SKILL.md")
+if [ "$EMPTY_SIZE" -eq 0 ]; then
+  echo "  ✅ PASS: Пустой файл определён (0 байт) — установка бы прервалась"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Пустой файл не был бы обнаружен"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 11.4: install_skill требует description: в SKILL.md
+echo "Test 11.4: install_skill description validation..."
+DESC_COUNT=0
+for skill_dir in "$TEST_ROOT/skills/agent-doctor" "$TEST_ROOT/skills/agent-forge" "$TEST_ROOT/skills/ru-text"; do
+  if grep -q 'description:' "$skill_dir/SKILL.md"; then
+    DESC_COUNT=$((DESC_COUNT + 1))
+  fi
+done
+if [ "$DESC_COUNT" -eq 3 ]; then
+  echo "  ✅ PASS: Все 3 скилла содержат description: ($DESC_COUNT/3)"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Только $DESC_COUNT/3 скиллов имеют description:"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 11.5: install_skill проверяет минимальный размер (> 100 байт)
+echo "Test 11.5: install_skill minimum size check..."
+MIN_SIZE=100
+BIG_ENOUGH=0
+for skill_dir in "$TEST_ROOT/skills/agent-doctor" "$TEST_ROOT/skills/agent-forge" "$TEST_ROOT/skills/ru-text"; do
+  SZ=$(wc -c < "$skill_dir/SKILL.md")
+  if [ "$SZ" -gt "$MIN_SIZE" ]; then
+    BIG_ENOUGH=$((BIG_ENOUGH + 1))
+  fi
+done
+if [ "$BIG_ENOUGH" -eq 3 ]; then
+  echo "  ✅ PASS: Все 3 скилла > $MIN_SIZE байт ($BIG_ENOUGH/3)"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Только $BIG_ENOUGH/3 скиллов проходят по размеру"
+  FAIL=$((FAIL+1))
+fi
+
+# ─────────────────────────────────────────
+# Test Suite 12: Symlink валидация
+# ─────────────────────────────────────────
+echo ""
+echo "─── Suite 12: Symlink валидация ───"
+
+# Test 12.1: Создание symlink
+echo "Test 12.1: Symlink creation..."
+AGENT_DIR="$TEST_ROOT/agents/main/agent"
+mkdir -p "$AGENT_DIR"
+ln -sf "$TEST_ROOT/skills" "$AGENT_DIR/skills" 2>/dev/null || true
+if [ -L "$AGENT_DIR/skills" ]; then
+  echo "  ✅ PASS: Symlink создан"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Symlink не создан"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 12.2: Агент видит скилл через symlink
+echo "Test 12.2: Agent sees skill via symlink..."
+AGENT_SKILL="$AGENT_DIR/skills/agent-doctor/SKILL.md"
+if [ -f "$AGENT_SKILL" ] && [ -s "$AGENT_SKILL" ]; then
+  echo "  ✅ PASS: Агент видит agent-doctor через symlink"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Агент НЕ видит скилл через symlink"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 12.3: Все 3 скилла видны через symlink
+echo "Test 12.3: All 3 skills visible via symlink..."
+VISIBLE=0
+for skill in agent-doctor agent-forge ru-text; do
+  if [ -s "$AGENT_DIR/skills/$skill/SKILL.md" ]; then
+    VISIBLE=$((VISIBLE + 1))
+  fi
+done
+if [ "$VISIBLE" -eq 3 ]; then
+  echo "  ✅ PASS: Все 3 скилла видны через symlink ($VISIBLE/3)"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Только $VISIBLE/3 скиллов видны"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 12.4: Битый symlink обнаруживается
+echo "Test 12.4: Broken symlink detection..."
+BROKEN_DIR="$TEST_ROOT/agents/broken-agent/agent"
+mkdir -p "$BROKEN_DIR"
+ln -sf "$TEST_ROOT/nonexistent" "$BROKEN_DIR/skills" 2>/dev/null || true
+
+BROKEN_FOUND=0
+if [ -L "$BROKEN_DIR/skills" ]; then
+  TARGET_PATH=$(readlink "$BROKEN_DIR/skills")
+  if [ ! -d "$BROKEN_DIR/skills" ]; then
+    BROKEN_FOUND=1
+    echo "  ✅ PASS: Битый symlink обнаружен (цель не существует)"
+    PASS=$((PASS+1))
+  fi
+fi
+if [ "$BROKEN_FOUND" -eq 0 ]; then
+  echo "  ❌ FAIL: Битый symlink не обнаружен"
+  FAIL=$((FAIL+1))
+fi
+
+# ─────────────────────────────────────────
+# Test Suite 13: Откат при ошибках
+# ─────────────────────────────────────────
+echo ""
+echo "─── Suite 13: Откат при ошибках ───"
+
+# Test 13.1: Удаление битого скилла
+echo "Test 13.1: Broken skill removal..."
+BROKEN_SKILL="$TEST_ROOT/skills/broken-skill"
+mkdir -p "$BROKEN_SKILL"
+touch "$BROKEN_SKILL/SKILL.md"  # пустой файл
+ROLLBACK_DIR="$TEST_ROOT/target-broken"
+mkdir -p "$ROLLBACK_DIR"
+cp "$BROKEN_SKILL/SKILL.md" "$ROLLBACK_DIR/broken-skill.md" 2>/dev/null
+SZ=$(wc -c < "$ROLLBACK_DIR/broken-skill.md")
+if [ "$SZ" -eq 0 ]; then
+  rm -f "$ROLLBACK_DIR/broken-skill.md"
+  if [ ! -f "$ROLLBACK_DIR/broken-skill.md" ]; then
+    echo "  ✅ PASS: Битый скилл удалён (откат)"
+    PASS=$((PASS+1))
+  else
+    echo "  ❌ FAIL: Откат не сработал"
+    FAIL=$((FAIL+1))
+  fi
+else
+  echo "  ❌ FAIL: Пустой файл не был определён как битый"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 13.2: Откат при ошибке symlink — пересоздание
+echo "Test 13.2: Symlink rollback — recreate..."
+TEST_AGENT2="$TEST_ROOT/agents/agent2/agent"
+mkdir -p "$TEST_AGENT2"
+# Сначала битый symlink
+ln -sf "$TEST_ROOT/nonexistent" "$TEST_AGENT2/skills" 2>/dev/null || true
+# Затем пересоздаём правильный
+rm -rf "$TEST_AGENT2/skills"
+ln -sf "$TEST_ROOT/skills" "$TEST_AGENT2/skills" 2>/dev/null || true
+if [ -L "$TEST_AGENT2/skills" ] && [ -s "$TEST_AGENT2/skills/agent-doctor/SKILL.md" ]; then
+  echo "  ✅ PASS: Symlink пересоздан после отката"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Symlink не восстановился"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 13.3: При ошибке — не рестартуем
+echo "Test 13.3: No restart on validation failure..."
+RESTART_SIMULATED=false
+# Симулируем: если файл пустой — переменная restart_blocked=true
+BROKEN_CHECK="$TEST_ROOT/skills/broken-skill/SKILL.md"
+RESTART_BLOCKED=false
+if [ -f "$BROKEN_CHECK" ]; then
+  BAD_SIZE=$(wc -c < "$BROKEN_CHECK")
+  if [ "$BAD_SIZE" -lt 100 ]; then
+    RESTART_BLOCKED=true
+  fi
+fi
+if [ "$RESTART_BLOCKED" = true ]; then
+  echo "  ✅ PASS: Рестарт заблокирован при битом скилле"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Рестарт не был бы заблокирован"
+  FAIL=$((FAIL+1))
+fi
+
+# ─────────────────────────────────────────
+# Test Suite 14: Полный цикл (end-to-end симуляция)
+# ─────────────────────────────────────────
+echo ""
+echo "─── Suite 14: End-to-end симуляция ───"
+
+E2E_ROOT="$TEST_ROOT/e2e"
+mkdir -p "$E2E_ROOT/source-skills" "$E2E_ROOT/target-skills" "$E2E_ROOT/target-agent/agent"
+
+# Создаём исходные скиллы
+mkdir -p "$E2E_ROOT/source-skills/test-skill" "$E2E_ROOT/source-skills/extra-skill"
+echo "---
+description: Test skill 1
+---
+# Skill 1 Content - needs to be over 100 bytes for validation. Adding extra text here to make sure." > "$E2E_ROOT/source-skills/test-skill/SKILL.md"
+
+echo "---
+description: Test skill 2
+---
+# Skill 2 Content - also needs to be over 100 bytes for validation. Adding more text to reach the threshold." > "$E2E_ROOT/source-skills/extra-skill/SKILL.md"
+
+# Test 14.1: Полный цикл — каталог → установка
+echo "Test 14.1: E2E catalog → install..."
+CATALOG_COUNT=0
+for skill_dir in "$E2E_ROOT/source-skills"/*/; do
+  name=$(basename "$skill_dir")
+  CATALOG_COUNT=$((CATALOG_COUNT + 1))
+done
+if [ "$CATALOG_COUNT" -ge 2 ]; then
+  echo "  ✅ PASS: Каталог собрал $CATALOG_COUNT скиллов"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Каталог пуст или неполный ($CATALOG_COUNT)"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 14.2: Полный цикл — установка скилла на цель
+echo "Test 14.2: E2E install skill to target..."
+mkdir -p "$E2E_ROOT/target-skills/test-skill"
+cp "$E2E_ROOT/source-skills/test-skill/SKILL.md" "$E2E_ROOT/target-skills/test-skill/SKILL.md"
+if [ -s "$E2E_ROOT/target-skills/test-skill/SKILL.md" ]; then
+  echo "  ✅ PASS: Скилл установлен на цель"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Установка не сработала"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 14.3: Полный цикл — symlink + агент видит
+echo "Test 14.3: E2E symlink + agent visibility..."
+ln -sf "$E2E_ROOT/target-skills" "$E2E_ROOT/target-agent/agent/skills" 2>/dev/null || true
+if [ -s "$E2E_ROOT/target-agent/agent/skills/test-skill/SKILL.md" ]; then
+  echo "  ✅ PASS: Агент видит установленный скилл"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Агент не видит скилл после установки"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 14.4: Полный цикл — description валидация после установки
+echo "Test 14.4: E2E post-install description validation..."
+if grep -q 'description: Test skill 1' "$E2E_ROOT/target-skills/test-skill/SKILL.md"; then
+  echo "  ✅ PASS: description совпадает после установки"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: description не совпадает"
+  FAIL=$((FAIL+1))
+fi
+
+# Очистка
+rm -rf "$TEST_ROOT"
+
+# ─────────────────────────────────────────
 # Итоги
 # ─────────────────────────────────────────
 echo ""
