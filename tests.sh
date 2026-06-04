@@ -502,6 +502,53 @@ else
 fi
 
 # ─────────────────────────────────────────
+# Test Suite 10: Локальный источник скиллов (без titov-main)
+# ─────────────────────────────────────────
+echo ""
+echo "─── Suite 10: Локальный источник ───"
+
+# Test 10.1: Нет захардкоженного titov-main IP (162.248.164.75)
+echo "Test 10.1: No titov-main IP hardcoded..."
+if grep -q '162.248.164.75' "$SKILL_FILE"; then
+  echo "  ❌ FAIL: Найден захардкоженный IP titov-main"
+  FAIL=$((FAIL+1))
+else
+  echo "  ✅ PASS: IP titov-main не захардкожен"
+  PASS=$((PASS+1))
+fi
+
+# Test 10.2: Нет ssh user@titov-main в командах
+echo "Test 10.2: No ssh to titov-main..."
+if grep -q 'ssh.*titov-main' "$SKILL_FILE"; then
+  echo "  ❌ FAIL: Найден ssh на titov-main"
+  FAIL=$((FAIL+1))
+else
+  echo "  ✅ PASS: Нет ssh на titov-main"
+  PASS=$((PASS+1))
+fi
+
+# Test 10.3: Локальный путь ~/.openclaw/skills/ используется для каталога
+echo "Test 10.3: Local skills directory used..."
+if grep -qP 'for skill_dir in ~/.openclaw/skills/\*/' "$SKILL_FILE"; then
+  echo "  ✅ PASS: Каталог собирается с локального ~/.openclaw/skills/"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Каталог не использует локальный путь"
+  FAIL=$((FAIL+1))
+fi
+
+# Test 10.4: scp с локального пути (не root@server:)
+echo "Test 10.4: scp from local path..."
+LOCAL_SCP=$(grep -c 'scp ~/.openclaw/skills/' "$SKILL_FILE" 2>/dev/null || echo 0)
+if [ "$LOCAL_SCP" -ge 1 ]; then
+  echo "  ✅ PASS: scp с локального ~/.openclaw/skills/ ($LOCAL_SCP раз)"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ FAIL: Нет scp с локального пути"
+  FAIL=$((FAIL+1))
+fi
+
+# ─────────────────────────────────────────
 # Итоги
 # ─────────────────────────────────────────
 echo ""

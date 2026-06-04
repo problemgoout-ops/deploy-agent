@@ -977,9 +977,9 @@ nproc
 
 **Философия:** если бы вы начинали сегодня с нуля — вы бы начали с этого. Не нужно проходить путь из месяцев проб и ошибок. Берёте готовое и сразу работающее.
 
-### Шаг 19: Установить обязательные скиллы (единый механизм)
+### Шаг 19: Установить обязательные скиллы
 
-**Все скиллы устанавливаются одним способом — `scp` с сервера-источника (titov-main). Никаких git clone, никакого ClawHub.**
+**Все скиллы устанавливаются из локального `~/.openclaw/skills/` на этом же сервере. Никаких внешних источников, никакого ClawHub.**
 
 Обязательные скиллы (устанавливаются всегда, без спроса):
 - **agent-doctor** — самодиагностика (7 категорий + автофиксы)
@@ -988,7 +988,7 @@ nproc
 
 ```bash
 # Единый механизм установки скиллов
-SOURCE="root@162.248.164.75"  # titov-main
+# Скиллы копируются с локального ~/.openclaw/skills/ (этот сервер)
 TARGET="root@${TARGET_IP}"    # сервер пользователя
 
 # Список обязательных скиллов
@@ -996,21 +996,21 @@ REQUIRED_SKILLS="agent-doctor agent-forge ru-text"
 
 install_skill() {
   local skill=$1
-  local src=$2
-  local dst=$3
+  local dst=$2
   
   echo "=== Установка: $skill ==="
   
-  # 1. Создать директорию
+  # 1. Создать директорию на целевом сервере
   ssh $dst "mkdir -p ~/.openclaw/skills/$skill"
   
-  # 2. Скопировать SKILL.md
+  # 2. Скопировать SKILL.md с локального ~/.openclaw/skills/
   scp ~/.openclaw/skills/$skill/SKILL.md ${dst}:~/.openclaw/skills/$skill/SKILL.md
   
   # 3. Скопировать references если есть
-  ssh $src "[ -d ~/.openclaw/skills/$skill/references ]" && \
-    ssh $dst "mkdir -p ~/.openclaw/skills/$skill/references" && \
+  if [ -d ~/.openclaw/skills/$skill/references ]; then
+    ssh $dst "mkdir -p ~/.openclaw/skills/$skill/references"
     scp -r ~/.openclaw/skills/$skill/references/* ${dst}:~/.openclaw/skills/$skill/references/ 2>/dev/null || true
+  fi
   
   # 4. Верификация: файл существует и не пустой
   if ssh $dst "[ -s ~/.openclaw/skills/$skill/SKILL.md ]"; then
@@ -1025,14 +1025,14 @@ install_skill() {
 # Установить все обязательные скиллы
 FAILED=""
 for skill in $REQUIRED_SKILLS; do
-  if ! install_skill "$skill" "$SOURCE" "$TARGET"; then
+  if ! install_skill "$skill" "$TARGET"; then
     FAILED="$FAILED $skill"
   fi
 done
 
 if [ -n "$FAILED" ]; then
   echo "❌ Не удалось установить:$FAILED"
-  echo "Проверь подключение к серверу-источнику"
+  echo "Проверь что ~/.openclaw/skills/ содержит все обязательные скиллы на этом сервере"
   exit 1
 fi
 
@@ -1241,21 +1241,19 @@ echo '==========================================='
 
 ### Как собирать каталог
 
-**Источник:** `~/.openclaw/skills/` на titov-main. Каталог собирается динамически — не захардкожен.
+**Источник:** `~/.openclaw/skills/` на этом же сервере (где запущен скилл). Каталог собирается динамически.
 
 ```bash
-# Собрать все скиллы с titov-main
-ssh user@titov-main "
-  echo '=== Доступные скиллы ==='
-  for skill_dir in ~/.openclaw/skills/*/; do
-    name=\$(basename \"\$skill_dir\")
-    skillfile=\"\${skill_dir}SKILL.md\"
-    if [ -f \"\$skillfile\" ]; then
-      desc=\$(grep -m1 '^description:' \"\$skillfile\" | sed 's/^description: *//' | tr -d '\"' | head -c 80)
-      echo \"  \$name — \$desc\"
-    fi
-  done
-"
+# Собрать все скиллы с локальной директории
+echo '=== Доступные скиллы ==='
+for skill_dir in ~/.openclaw/skills/*/; do
+  name=$(basename "$skill_dir")
+  skillfile="${skill_dir}SKILL.md"
+  if [ -f "$skillfile" ]; then
+    desc=$(grep -m1 '^description:' "$skillfile" | sed 's/^description: *//' | tr -d '"' | head -c 80)
+    echo "  $name — $desc"
+  fi
+done
 ```
 
 ### Как показывать пользователю
@@ -1266,10 +1264,10 @@ ssh user@titov-main "
 
 **Остальные:** сгруппировать по категориям. Каждая категория с заголовком, каждый скилл одной строкой.
 
-Пример вывода (генерируется из реального списка на titov-main):
+Пример вывода (генерируется из реального списка на этом сервере):
 
 ```
-📦 Доступные скиллы (с titov-main):
+📦 Доступные скиллы (с этого сервера):
 
 ✅ Уже установлены:
 • agent-doctor — самодиагностика
@@ -1315,13 +1313,12 @@ ssh user@titov-main "
 
 ```bash
 # SKILLS_TO_INSTALL="server-connect docker-sandbox" (получено от пользователя)
-# SOURCE_SERVER="titov-main" (или другой сервер-источник)
 
 for skill in $SKILLS_TO_INSTALL; do
   echo "=== Установка скилла: $skill ==="
   
-  # 1. Скопировать с сервера-источника
-  scp root@${SOURCE_SERVER}:~/.openclaw/skills/${skill}/SKILL.md root@${TARGET}:~/.openclaw/skills/${skill}/
+  # 1. Скопировать с локального ~/.openclaw/skills/
+  scp ~/.openclaw/skills/${skill}/SKILL.md root@${TARGET}:~/.openclaw/skills/${skill}/
   
   # 2. Проверить что файл скопирован и не пустой
   ssh root@${TARGET} "
