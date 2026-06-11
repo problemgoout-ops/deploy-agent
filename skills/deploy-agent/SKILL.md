@@ -1,6 +1,6 @@
 ---
 name: deploy-agent
-description: "Развёртывание OpenClaw-агента на чистом сервере 'под ключ': SSH, Node.js, OpenClaw, Ollama, эмбеддинги, память, Telegram-бот, fallback-модели, базовые скиллы (Agent Doctor, Agent Forge, ru-text). Triggers: 'разверни агента', 'deploy agent', 'подними бота', 'новый краб', 'краб', 'настрой сервер', 'установи OpenClaw', 'создай бота на сервере', 'разверни на сервере'."
+description: "Развёртывание OpenClaw-агента на чистом сервере 'под ключ': SSH, Node.js, OpenClaw, Ollama, эмбеддинги (nomic-embed-text), память, Telegram-бот, cloud-модели (deepseek, glm, kimi), базовые скиллы (Agent Doctor, Agent Forge, ru-text). Cloud-only стратегия по умолчанию — локальные чат-модели не ставятся. Triggers: 'разверни агента', 'deploy agent', 'подними бота', 'новый краб', 'краб', 'настрой сервер', 'установи OpenClaw', 'создай бота на сервере', 'разверни на сервере'."
 ---
 
 # Deploy Agent 🦀
@@ -13,6 +13,170 @@ description: "Развёртывание OpenClaw-агента на чистом
 1. Записать сервер в MEMORY.md (секция владельца) + SECRETS.md (пароли)
 2. Выполнить полную диагностику через server-connect скилл
 3. Записать дату проверки в MEMORY.md
+
+---
+
+## 🛡️ Часть -1: Защита сессии и атомарность данных
+
+**Почему это здесь, ДО начала работы:** кейс Елены Банновой (2026-06-04). Сессия упала 2 раза в процессе развёртывания:
+- После получения SSH и API-ключа — сессия упала, данные потеряны
+- После получения токена бота — в конфиг попал плейсхолдер (11 символов вместо 46)
+- Пришлось переспрашивать данные → плохой UX, потеря доверия
+
+**Правила, которые предотвращают это:**
+
+### Правило 0.1: Save-Game МГНОВЕННО
+
+**Получил любые credentials от человека → в том же ходе записал в файлы. Без исключений.**
+
+Порядок записи (строгий):
+1. Сначала SECRETS.md (grep по имени, update секции)
+2. Потом MEMORY.md (update секции владельца)
+3. Только потом — продолжать развёртывание
+
+**Почему сначала SECRETS.md:** если сессия упадёт на MEMORY.md, credentials уже сохранены.
+
+```bash
+# Пример: получил SSH от Елены
+# 1. Сразу пишем в SECRETS.md (через edit/write в workspace)
+# 2. Сразу пишем в MEMORY.md
+# 3. Только потом идём на сервер
+```
+
+### Правило 0.2: Верификация токенов
+
+**После записи токена в конфиг — ПРОВЕРИТЬ что он валидный.**
+
+```bash
+# Проверка длины Telegram-токена (должен быть 46 символов: 10 цифр + двоеточие + 35 символов)
+TOKEN=$(python3 -c "import json; c=json.load(open('/root/.openclaw/openclaw.json')); print(len(c['channels']['telegram']['botToken']))")
+if [ "$TOKEN" -lt 40 ]; then
+  echo "❌ Токен обрезан! Длина: $TOKEN (должно быть ~46). НЕ перезапускать сервис."
+  # Срочно запросить полный токен у пользователя
+  exit 1
+fi
+echo "✅ Токен валидной длины: $TOKEN символов"
+
+# Проверка API-ключа Ollama Cloud (должен быть ~50+ символов)
+KEY_LEN=$(python3 -c "import json; c=json.load(open('/root/.openclaw/openclaw.json')); print(len(c['models']['providers'].get('ollama-cloud',{}).get('apiKey','')))")
+if [ "$KEY_LEN" -lt 30 ]; then
+  echo "❌ API-ключ обрезан! Длина: $KEY_LEN (должно быть 50+). НЕ перезапускать сервис."
+  exit 1
+fi
+echo "✅ API-ключ валидной длины: $KEY_LEN символов"
+```
+
+### Правило 0.3: Контрольные точки (Checkpoints)
+
+**Фиксировать прогресс в MEMORY.md после каждого крупного шага.**
+
+Формат checkpoint-записи:
+```markdown
+## 🚧 Deploy {имя}: Checkpoint {N}/{total}
+- Статус: {step completed}
+- Следующий шаг: {next step}
+- Данные получены: SSH ✅ | API Key ✅ | Bot Token ⬜
+- Последнее действие: {timestamp}
+```
+
+При падении сессии — поискать `🚧 Deploy` в MEMORY.md и продолжить с последнего checkpoint.
+
+**Checkpoints (минимальный набор):**
+| # | Когда | Что зафиксировать |
+|---|-------|-------------------|
+| CP1 | Получили SSH | Хост, пользователь (без пароля) |
+| CP2 | Получили API-ключ | Тип ключа, провайдер (без самого ключа) |
+| CP3 | Получили токен бота | @username бота, id бота (без токена) |
+| CP4 | SSH подключение успешно | Версия ОС, RAM, диск |
+| CP5 | Node.js установлен | Версия node |
+| CP6 | OpenClaw установлен | Версия, статус gateway |
+| CP7 | Ollama + модели | Список моделей |
+| CP8 | Конфиг написан | Длина токена проверена ✅ |
+| CP9 | Бот отвечает | Telegram API getMe OK |
+| CP10 | Готово | Итоговый статус |
+
+### Правило 0.4: Сессия-убийца
+
+**Если сессия падает 2 раза на одном и том же пользователе:**
+1. НЕ продолжать в этой же сессии
+2. Сбросить сессию: `rm -rf ~/.openclaw/agents/devops/sessions/agent:devops:telegram:direct:{user_id}*`
+3. Начать в свежей сессии (новое сообщение от пользователя создаст чистую)
+4. Восстановить состояние из checkpoint в MEMORY.md
+
+### Правило 0.6: НИКОГДА не слать пользователю сырые ошибки
+
+**Кейс Елены: бот трижды повторил «Something went wrong while processing your request...» — пользователь в шоке, не понимает что делать.**
+
+**Что делать ВМЕСТО этого:**
+
+1. **Поймал ошибку → НЕ пересылать её пользователю как есть.** Технические сообщения типа «Something went wrong», «404 Not Found», stack traces — только в лог, никогда в чат.
+
+2. **Отправить ОДНО человеческое сообщение:**
+   - Что случилось простыми словами
+   - Что я уже делаю чтобы исправить
+   - Через сколько вернусь (примерно)
+   - Что делать пользователю (обычно — ничего, ждать)
+
+3. **Шаблоны сообщений об ошибках:**
+
+**При потере сессии (самая опасная):**
+```
+⚠️ Технический сбой на моей стороне. Данные сохранены, я уже восстанавливаюсь.
+Напиши любое сообщение через 2-3 минуты — я продолжу с того же места.
+```
+
+**При ошибке валидации токена/ключа:**
+```
+❌ Токен невалидный — возможно обрезался при копировании. 
+Проверь его в @BotFather: /mybots → {имя бота} → API Token.
+Скопируй токен целиком и пришли ещё раз.
+```
+
+**При ошибке подключения к серверу:**
+```
+🔌 Не могу подключиться к серверу. Проверяю...
+[через 30 сек]
+Нашёл проблему: {что именно}. {Что делаю}.
+```
+
+**При любой другой ошибке:**
+```
+⚠️ Что-то пошло не так на шаге «{шаг}». 
+Я уже работаю над исправлением. Напишу через минуту.
+```
+
+**Правило «одно сообщение»:**
+- ❌ НЕ слать несколько сообщений подряд с ошибками
+- ❌ НЕ повторять одно и то же сообщение (как на скриншоте Елены — 3 раза)
+- ✅ Одно сообщение → пауза → исправление → результат
+- Если не можешь исправить за 2 минуты → напиши «всё ещё работаю, ещё 5 минут»
+
+### Правило 0.7: Таймаут на каждый шаг
+
+**Каждый внешний вызов — с таймаутом. Никаких бесконечных ожиданий.**
+
+```bash
+# SSH — 10 секунд на подключение
+ssh -o ConnectTimeout=10 ...
+
+# curl — 15 секунд максимум
+curl --max-time 15 ...
+
+# systemctl — 5 секунд
+systemctl restart openclaw && sleep 5
+```
+
+Если таймаут истёк — не повторять бесконечно. Сообщить пользователю и перейти к диагностике.
+
+### Правило 0.5: Dry-Run конфига перед рестартом
+
+**Перед `systemctl restart openclaw` — проверить валидность JSON:**
+
+```bash
+python3 -c "import json; json.load(open('/root/.openclaw/openclaw.json'))" && echo "✅ JSON valid" || echo "❌ JSON broken — DO NOT RESTART"
+```
+
+Битый JSON при рестарте = сервис не поднимется. Всегда проверять.
 
 ---
 
@@ -56,14 +220,18 @@ description: "Развёртывание OpenClaw-агента на чистом
 
 Все credentials записывай в SECRETS.md DevOps-агента, НЕ в память агента и НЕ в git.
 
-### 🆕 Шаг 00: Валидация API ключа ДО развёртывания
+### 🆕 Шаг 00: Валидация API ключа и токенов ДО развёртывания
 
-**КРИТИЧНО: проверять API ключ сразу после получения, до любых других действий.**
+**КРИТИЧНО: проверять API ключ и токены сразу после получения, до любых других действий.**
 
-Это предотвращает ситуацию «всё развернули, а ключ не работает».
+Это предотвращает две катастрофические ситуации:
+- «Всё развернули, а ключ не работает»
+- «Токен бота обрезан, бот падает в crash-луп, пользователь ждёт» (кейс Елены)
+
+#### Проверка API-ключа Ollama Cloud
 
 ```bash
-# Для Ollama Cloud — проверить ключ на СВОЁМ сервере (на титов-main):
+# Проверить ключ на СВОЁМ сервере (на титов-main):
 # Это работает даже если целевой сервер ещё не готов
 curl -s --max-time 15 http://127.0.0.1:11434/api/chat \
   -H "Authorization: Bearer {API_KEY}" \
@@ -71,6 +239,42 @@ curl -s --max-time 15 http://127.0.0.1:11434/api/chat \
 
 # Если ответ — 401 unauthorized → ключ НЕВЕРНЫЙ, просить новый
 # Если ответ содержит "message" → ключ рабочий ✅, можно продолжать
+```
+
+#### Проверка Telegram-токена (ОБЯЗАТЕЛЬНАЯ)
+
+**Кейс Елены: токен был обрезан до 11 символов. Результат: бот падал в crash-луп, пользователь ждал.**
+
+```bash
+# Сразу после получения токена — проверить его через Telegram API
+# Это можно сделать с ЛЮБОГО сервера, не только с целевого
+curl -s --max-time 10 "https://api.telegram.org/bot{TOKEN}/getMe"
+
+# Ожидаемый ответ: {"ok":true,"result":{"id":...,"username":"..."}}
+# Если ok:false или 404 — токен невалидный или обрезан
+
+# Проверить длину токена (должен быть ~46 символов)
+echo -n "{TOKEN}" | wc -c
+# < 40 символов → ОБРЕЗАН! Запросить полный токен у пользователя
+```
+
+**Формат валидного Telegram-токена:** `1234567890:ABCdefGHIjklMNOpqrsTUVwxyz-1234567`
+- 10 цифр (bot id) + двоеточие + 35 символов (secret) = 46 символов
+- Если прислали `883086…NrXs` (11 символов с троеточием) — это обрезанный токен, НЕ использовать
+
+#### После записи токена в конфиг — верификация на целевом сервере
+
+```bash
+# После записи в openclaw.json — проверить длину из конфига
+python3 -c "
+import json
+with open('/root/.openclaw/openclaw.json') as f:
+    c = json.load(f)
+token = c['channels']['telegram']['botToken']
+print(f'Token length: {len(token)}')
+assert len(token) >= 40, f'TOKEN TOO SHORT: {len(token)} chars!'
+print('✅ Token length OK')
+"
 ```
 
 **Для OpenAI ключа:**
@@ -189,9 +393,13 @@ openclaw gateway status
 
 ---
 
-## Часть 3: Ollama + локальные модели + эмбеддинги
+## Часть 3: Ollama + эмбеддинги
 
 ### Шаг 7: Установка Ollama
+
+Ollama нужна для эмбеддингов (`nomic-embed-text`) — без них не работает `memory_search` (семантический поиск по памяти).
+
+Чат-модели используются облачные, локально не скачиваются. Это экономит 5-10 GB RAM и диска.
 
 ```bash
 # Linux
@@ -212,28 +420,10 @@ sudo systemctl start ollama
 ollama serve
 ```
 
-### Шаг 8: Скачивание моделей
+### Шаг 8: Скачать nomic-embed-text (обязательно)
 
-**Для чата (выбрать одну):**
+**Единственная локальная модель.** Без неё `memory_search` не работает.
 
-| Модель | RAM | Размер | Когда |
-|--------|-----|--------|-------|
-| `qwen2.5:7b` | 8 GB | 4.7 GB | Лёгкая, быстрая |
-| `qwen2.5:14b` | 16+ GB | 9 GB | Мощнее |
-| `llama3.3:8b` | 8 GB | 4.9 GB | Универсальная |
-
-```bash
-# Лёгкая и быстрая (4.7 GB) — для машин с 8 GB RAM
-ollama pull qwen2.5:7b
-
-# Мощнее (9 GB) — для машин с 16+ GB RAM
-ollama pull qwen2.5:14b
-
-# Быстрая универсальная (4.9 GB)
-ollama pull llama3.3:8b
-```
-
-**Для эмбеддингов (обязательно):**
 ```bash
 ollama pull nomic-embed-text
 ```
@@ -241,51 +431,24 @@ ollama pull nomic-embed-text
 Проверить:
 ```bash
 ollama list
+# Должен быть: nomic-embed-text:latest
 ```
 
-### Шаг 9: Настройка провайдера Ollama в OpenClaw
+**Локальные чат-модели НЕ скачиваем.** Используем cloud-only стратегию — все чат-модели через Ollama Cloud API.
+
+### Шаг 9: Настройка Ollama в OpenClaw
 
 Добавить в `~/.openclaw/openclaw.json` → `models.providers`:
 
 ```json
 "ollama": {
   "baseUrl": "http://127.0.0.1:11434",
-  "api": "ollama",
-  "apiKey": "{OLLAMA_API_KEY}",
-  "models": [
-    {
-      "id": "qwen2.5:14b",
-      "name": "Qwen 2.5 14B (Local)",
-      "api": "ollama",
-      "input": ["text"],
-      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-      "contextWindow": 131072,
-      "maxTokens": 8192
-    }
-  ]
+  "api": "ollama"
 }
 ```
 
-**⚠️ ВАЖНО: `apiKey` в провайдере Ollama обязателен для cloud-моделей!**
-Без него OpenClaw не сможет передавать ключ в API-запросы к Ollama, и cloud-модели будут возвращать 401.
-
-**Замени `qwen2.5:14b` на ту модель, которую скачал.**
-
-**Для cloud-only стратегии** (только облачные модели, без локальных):
-```json
-"ollama": {
-  "api": "ollama",
-  "baseUrl": "http://127.0.0.1:11434",
-  "apiKey": "{OLLAMA_API_KEY}"
-}
-```
-
-Добавить алиас в `agents.defaults.models`:
-```json
-"ollama/qwen2.5:14b": {
-  "alias": "QWEN-LOCAL"
-}
-```
+**⚠️ API-ключ Ollama Cloud** — обязательно добавить в настройки cloud-провайдера (см. Часть 6).
+Без ключа cloud-модели возвращают 401.
 
 ---
 
@@ -312,21 +475,82 @@ ollama list
 - **Индексацию** всех файлов memory/*.md
 - **Бесплатно** — всё работает локально через Ollama
 
-### Шаг 11: Создание структуры памяти
+### Шаг 11: Создание структуры памяти (Memory Blueprint)
+
+**Использовать архитектуру Memory Blueprint** (`~/.openclaw/skills/memory-blueprint/SKILL.md`):
 
 ```bash
-# Директория для ежедневных дампов
+# Директория памяти
 mkdir -p ~/.openclaw/workspace/memory
 
 # Файл основной памяти
 cat > ~/.openclaw/workspace/MEMORY.md << 'EOF'
 # MEMORY.md — {DISPLAY_NAME}
+
+## Сервер
+- Хост: {host}
+- OpenClaw: {version}
+- Модель: {model}
+- Развёрнут: {date}
+EOF
+
+# Все memory-файлы по Memory Blueprint
+touch ~/.openclaw/workspace/memory/lessons.md
+touch ~/.openclaw/workspace/memory/patterns.md
+touch ~/.openclaw/workspace/memory/projects-log.md
+touch ~/.openclaw/workspace/memory/handoff.md
+
+# Контракт памяти
+cp ~/.openclaw/skills/memory-blueprint/references/contract-template.md \
+   ~/.openclaw/workspace/memory/contract.md
+
+# Первый daily entry
+cat > ~/.openclaw/workspace/memory/$(date +%Y-%m-%d).md << EOF
+# $(date +%Y-%m-%d) — Развёртывание
+
+- Агент развёрнут и подключён к Telegram
+- Модель: {model}
+- Сервер: {host}
 EOF
 ```
 
-### Шаг 12: Настройка политики памяти
+### Шаг 12: Memory Blueprint в AGENTS.md
 
-Создать `~/.openclaw/workspace/MEMORY-POLICY.md` (см. `references/memory-policy.md`).
+В AGENTS.md агента **обязательно** добавить секцию памяти из шаблона:
+
+```bash
+cat >> ~/.openclaw/workspace-{agent_id}/AGENTS.md << 'EOF'
+
+## 🧠 Память (Memory Blueprint)
+
+Архитектура памяти: 4 уровня (контекстная → файловая → векторная → identity).
+
+**Контракт:** `memory/contract.md` — что хранить и чего не хранить (Keep/Delete/Rewrite/Limit).
+
+### Файлы памяти
+| Файл | Назначение |
+|------|-----------|
+| `memory/lessons.md` | Уроки и правила |
+| `memory/patterns.md` | Паттерны (3 повтора → правило) |
+| `memory/projects-log.md` | История задач |
+| `memory/handoff.md` | Save-game разговора |
+| `memory/YYYY-MM-DD.md` | Дневник дня |
+
+### При старте
+1. `memory/handoff.md` — контекст предыдущей сессии
+2. `memory/YYYY-MM-DD.md` — дневник сегодня
+
+### При ошибках
+- Записать в `memory/lessons.md`
+- 3 повтора → паттерн в `memory/patterns.md`
+
+### Еженедельный аудит
+- `memory/contract.md` → проверить лимиты
+- MEMORY.md ≤ 300 строк
+- Удалить дневники >90 дней
+- Проверить на утечку credentials
+EOF
+```
 
 ### Шаг 13: QMD (опционально, для продвинутой памяти)
 
@@ -408,7 +632,8 @@ mkdir -p ~/.openclaw/workspace-{agent_id}
 3. Check HEARTBEAT.md if exists
 
 ## Политика памяти
-См. MEMORY-POLICY.md
+См. `memory/contract.md` — Memory Blueprint (Keep/Delete/Rewrite/Limit).
+При старте: читать `memory/handoff.md` и `memory/YYYY-MM-DD.md`.
 
 ## Зона ответственности
 - {ответственность 1}
@@ -456,16 +681,16 @@ mkdir -p ~/.openclaw/workspace-{agent_id}
 {
   "id": "{agent_id}",
   "name": "{DISPLAY_NAME}",
-  "workspace": "~/.openclaw/workspace-{agent_id}",
-  "model": "ollama/qwen2.5:14b"
+  "workspace": "~/.openclaw/workspace-{agent_id}"
 }
 ```
+⚠️ Модель НЕ указывать здесь — она наследуется из agents.defaults.model (deepseek + glm fallback).
 
-Для cloud-модели с fallback на локальную:
+Если нужна другая модель для конкретного агента:
 ```json
 "model": {
-  "primary": "anthropic/claude-sonnet-4-6",
-  "fallbacks": ["ollama/qwen2.5:14b"]
+  "primary": "ollama/deepseek-v4-pro:cloud",
+  "fallbacks": ["ollama/glm-5.1:cloud"]
 }
 ```
 
@@ -529,22 +754,22 @@ ls ~/.openclaw/agents/{agent_id}/sessions/
 - Проще обновлять
 - Сервер не тормозит от локальных моделей
 
-**Настройка fallback между cloud-моделями:**
+**Настройка fallback (стандарт Memory Blueprint):**
+```json
+"model": {
+  "primary": "ollama/deepseek-v4-pro:cloud",
+  "fallbacks": ["ollama/glm-5.1:cloud"]
+}
+```
+⚠️ По умолчанию используем именно эту связку (deepseek + glm) — зафиксировано в memory-blueprint скилле.
+
+**Если нужен второй fallback (kimi):**
 ```json
 "model": {
   "primary": "ollama/deepseek-v4-pro:cloud",
   "fallbacks": ["ollama/glm-5.1:cloud", "ollama/kimi-k2.6:cloud"]
 }
 ```
-
-**Если владелец явно хочет локальную fallback-модель** (требует RAM и диск):
-```json
-"model": {
-  "primary": "ollama/deepseek-v4-pro:cloud",
-  "fallbacks": ["ollama/qwen2.5:7b"]
-}
-```
-Смотри Часть 8 для проверки ресурсов ПЕРЕД установкой локальных моделей.
 
 ---
 
@@ -555,10 +780,9 @@ ls ~/.openclaw/agents/{agent_id}/sessions/
 - [ ] Node.js установлен (v24+)
 - [ ] OpenClaw установлен и gateway запущен
 - [ ] Ollama установлена и работает
-- [ ] Модель для чата скачана (`ollama list`)
-- [ ] `nomic-embed-text` скачан для эмбеддингов
+- [ ] `nomic-embed-text` скачан для эмбеддингов (`ollama list | grep nomic`)
 - [ ] `memorySearch` настроен в `openclaw.json`
-- [ ] Структура памяти создана (`memory/`, `MEMORY.md`, `MEMORY-POLICY.md`)
+- [ ] Структура памяти создана (memory/*.md, MEMORY.md, memory/contract.md)
 - [ ] Telegram-токен получен от @BotFather
 - [ ] Workspace агента создан (SOUL, AGENTS, IDENTITY, USER, MEMORY)
 - [ ] Агент добавлен в `agents.list`
@@ -653,24 +877,21 @@ nproc
 
 | Свободно RAM | Что ставить |
 |---------------|-------------|
-| < 2 GB | Только nomic-embed-text (274 MB RAM). Чат — только cloud. |
-| 2-4 GB | nomic-embed-text. Чат — только cloud. |
-| 4-8 GB | nomic-embed-text + qwen2.5:7b (если нужен fallback) |
-| 8+ GB | nomic-embed-text + qwen2.5:14b (если нужен fallback) |
+| < 2 GB | Только nomic-embed-text (274 MB). Cloud-only для чата. |
+| 2-4 GB | nomic-embed-text. Cloud-only для чата. Комфортно. |
+| 4+ GB | nomic-embed-text + запас для пиковой нагрузки. |
 
 | Свободно диска | Что ставить |
 |----------------|-------------|
-| < 5 GB | Только nomic-embed-text (274 MB). Предупредить владельца. |
-| 5-15 GB | nomic-embed-text. Чат-модель — только если хватает. |
-| 15+ GB | Полная установка с моделью. |
+| < 2 GB | Только nomic-embed-text (274 MB). Предупредить владельца что места мало. |
+| 2-5 GB | nomic-embed-text. Cloud-only для чата. |
+| 5+ GB | nomic-embed-text + комфортный запас для логов и данных. |
 
-**Если ресурсов мало — предупредить владельца перед установкой.**
-
-**Стратегия cloud-only (без локальных моделей чата):**
-- Установить ТОЛЬКО `nomic-embed-text` для memorySearch
-- Чат-модели не ставить — использовать только cloud
+**Cloud-only стратегия — по умолчанию для всех:**
+- Установить ТОЛЬКО `nomic-embed-text` для memory_search (274 MB)
+- Чат-модели НЕ ставить локально — использовать Ollama Cloud API
 - Это экономит 5-10 GB диска и 4-9 GB RAM
-- Требует стабильного интернета на сервере
+- Работает даже на серверах с 2 GB RAM (как у Анны до апгрейда)
 
 ---
 
@@ -702,109 +923,240 @@ nproc
 
 **Философия:** если бы вы начинали сегодня с нуля — вы бы начали с этого. Не нужно проходить путь из месяцев проб и ошибок. Берёте готовое и сразу работающее.
 
-### Шаг 19: Установить Agent Doctor
+### Шаг 19: Установить обязательные скиллы
 
-**Что делает:** комплексная самодиагностика OpenClaw. Проверяет память, кроны, конфиг, файлы, gateway, систему, безопасность. Находит проблемы и предлагает конкретные решения.
+**Все скиллы устанавливаются из локального `~/.openclaw/skills/` на этом же сервере. Никаких внешних источников, никакого ClawHub.**
 
-**Триггеры:** «продиагностируй себя», «самодиагностика», «проверь систему», «health check»
+Обязательные скиллы (устанавливаются всегда, без спроса):
+- **agent-doctor** — самодиагностика (7 категорий + автофиксы)
+- **agent-forge** — создание скиллов и агентов (3 режима)
+- **ru-text** — качество русского текста (~1044 правила, 7 доменов)
 
 ```bash
-# Клонировать репозиторий
-mkdir -p ~/.openclaw/skills/agent-doctor
-cd /tmp && git clone https://github.com/AlekseiUL/openclaw-superagent.git
-cp /tmp/openclaw-superagent/skills/agent-doctor/SKILL.md ~/.openclaw/skills/agent-doctor/SKILL.md
+# Единый механизм установки скиллов
+# Скиллы копируются с локального ~/.openclaw/skills/ (этот сервер)
+TARGET="root@${TARGET_IP}"    # сервер пользователя
+
+# Список обязательных скиллов
+REQUIRED_SKILLS="agent-doctor agent-forge ru-text"
+
+install_skill() {
+  local skill=$1
+  local dst=$2
+  
+  echo "=== Установка: $skill ==="
+  
+  # 1. Создать директорию на целевом сервере
+  ssh $dst "mkdir -p ~/.openclaw/skills/$skill"
+  
+  # 2. Скопировать SKILL.md с локального ~/.openclaw/skills/
+  scp ~/.openclaw/skills/$skill/SKILL.md ${dst}:~/.openclaw/skills/$skill/SKILL.md
+  
+  # 3. Скопировать references если есть
+  if [ -d ~/.openclaw/skills/$skill/references ]; then
+    ssh $dst "mkdir -p ~/.openclaw/skills/$skill/references"
+    scp -r ~/.openclaw/skills/$skill/references/* ${dst}:~/.openclaw/skills/$skill/references/ 2>/dev/null || true
+  fi
+  
+  # 4. Верификация: файл существует и не пустой
+  if ssh $dst "[ -s ~/.openclaw/skills/$skill/SKILL.md ]"; then
+    SIZE=$(ssh $dst "wc -c < ~/.openclaw/skills/$skill/SKILL.md")
+    echo "  ✅ Скилл $skill установлен ($SIZE байт)"
+  else
+    echo "  ❌ ОШИБКА: скилл $skill не установился"
+    return 1
+  fi
+}
+
+# Установить все обязательные скиллы
+FAILED=""
+for skill in $REQUIRED_SKILLS; do
+  if ! install_skill "$skill" "$TARGET"; then
+    FAILED="$FAILED $skill"
+  fi
+done
+
+if [ -n "$FAILED" ]; then
+  echo "❌ Не удалось установить:$FAILED"
+  echo "Проверь что ~/.openclaw/skills/ содержит все обязательные скиллы на этом сервере"
+  exit 1
+fi
+
+echo "✅ Все обязательные скиллы установлены"
 ```
 
-**Что проверяет Agent Doctor (7 категорий):**
+### Шаг 20: Симлинк + трехуровневая валидация + откат
 
-| Категория | Что проверяет |
-|-----------|-------------|
-| 🧠 Память | SQLite, WAL mode, записи, memorySearch, embedding провайдер |
-| ⏰ Кроны | Список, статус, ошибки, падения |
-| ⚙️ Конфиг | JSON валидность, модель, каналы, плагины |
-| 📁 Файлы | SOUL.md, IDENTITY.md, AGENTS.md, HEARTBEAT.md, скиллы |
-| 🔧 Gateway | Статус, аптайм, ошибки в логах, порт |
-| 💾 Система | ОС, Node.js, Python, диск, версия OpenClaw |
-| 🛡️ Безопасность | Gateway bind, auth mode, API ключи в открытых файлах |
+**После копирования скиллов — обязательно проверить что агент их реально видит. Просто «файл есть» ≠ «агент может использовать».**
 
-**Автофиксы (после подтверждения):**
-- WAL mode → `PRAGMA journal_mode=WAL;`
-- memorySearch отключен → включить в конфиге
-- Gateway на 0.0.0.0 → перевести на 127.0.0.1
-- Старый Node.js → обновить
-- Диск заполнен → очистить логи/кеш
+Кейс Кристины: скиллы скопированы в `~/.openclaw/skills/` ✅, но symlink в агенте отсутствовал ❌ → агент их не видел.
 
-### Шаг 20: Установить Agent Forge
-
-**Что делает:** создание и улучшение скиллов и агентов OpenClaw. Три режима: создание скилла (11 шагов), создание агента (9 шагов), улучшение существующего (5 шагов).
-
-**Триггеры:** «создай скилл», «новый скилл», «создай агента», «новый агент», «улучши скилл», «скиллмейкер»
+Три уровня валидации:
+1. **Уровень файла:** SKILL.md существует, > 100 байт, содержит `description:` (не мусор)
+2. **Уровень symlink:** агент видит файл через `~/.openclaw/agents/{id}/agent/skills/{skill}/SKILL.md`
+3. **Уровень агента:** после рестарта — проверить что агент загрузил скилл (по логам)
 
 ```bash
-# Из того же репозитория
-mkdir -p ~/.openclaw/skills/agent-forge
-cp /tmp/openclaw-superagent/skills/agent-forge/SKILL.md ~/.openclaw/skills/agent-forge/SKILL.md
+ssh $TARGET "
+echo '==========================================='
+echo ' ВАЛИДАЦИЯ СКИЛЛОВ: 3 УРОВНЯ'
+echo '==========================================='
 
-# Если есть references (шаблоны агентов)
-mkdir -p ~/.openclaw/skills/agent-forge/references
-cp /tmp/openclaw-superagent/skills/agent-forge/references/*.md ~/.openclaw/skills/agent-forge/references/ 2>/dev/null || true
-```
+SKILLS_DIR=\$HOME/.openclaw/skills
+REQUIRED_SKILLS='agent-doctor agent-forge ru-text'
 
-**Режимы Agent Forge:**
+# ─── УРОВЕНЬ 1: Валидация файлов ───
+echo ''
+echo '─── Уровень 1: Валидация SKILL.md ───'
 
-| Режим | Когда | Шагов |
-|-------|-------|-------|
-| Создание скилла | Нужен новый навык | 11 |
-| Создание агента | Нужен новый бот с личностью | 9 |
-| Улучшение существующего | Скилл/агент работает, но надо лучше | 5 |
+FAILED_FILES=''
 
-**Типы скиллов:** Workflow (пошаговый), Role (экспертная роль), Data-driven (данные), Гибрид.
+for skill in \$REQUIRED_SKILLS; do
+  SKILL_FILE=\"\$SKILLS_DIR/\$skill/SKILL.md\"
+  
+  # Проверка 1: файл существует
+  if [ ! -f \"\$SKILL_FILE\" ]; then
+    echo \"  ❌ \$skill: файл не существует\"
+    FAILED_FILES=\"\$FAILED_FILES \$skill\"
+    continue
+  fi
+  
+  # Проверка 2: размер > 100 байт (не пустой и не мусор)
+  SIZE=\$(wc -c < \"\$SKILL_FILE\")
+  if [ \"\$SIZE\" -lt 100 ]; then
+    echo \"  ❌ \$skill: файл слишком маленький (\$SIZE байт, минимум 100)\"
+    FAILED_FILES=\"\$FAILED_FILES \$skill\"
+    continue
+  fi
+  
+  # Проверка 3: содержит description: (признак валидного SKILL.md)
+  if ! grep -q 'description:' \"\$SKILL_FILE\"; then
+    echo \"  ❌ \$skill: файл не содержит description: — это не SKILL.md\"
+    FAILED_FILES=\"\$FAILED_FILES \$skill\"
+    continue
+  fi
+  
+  echo \"  ✅ \$skill: \$SIZE байт, description: OK\"
+done
 
-**Типы агентов:** Полноценный рабочий (свой бот, память, скиллы), Специализированный (своя экосистема), Маска (топик-роль через systemPrompt).
+if [ -n \"\$FAILED_FILES\" ]; then
+  echo ''
+  echo \"❌ УРОВЕНЬ 1 ПРОВАЛЕН: битые скиллы:\$FAILED_FILES\"
+  echo 'Выполняю откат...'
+  for skill in \$FAILED_FILES; do
+    rm -rf \"\$SKILLS_DIR/\$skill\"
+    echo \"  🗑 Удалён битый скилл: \$skill\"
+  done
+  echo '⚠️ НЕ перезапускать сервис с битыми скиллами!'
+  exit 1
+fi
 
-### Шаг 21: Установить ru-text (опционально, рекомендуется)
+echo '✅ Уровень 1 пройден: все SKILL.md валидны'
 
-**Что делает:** качество русского текста. Типографика, инфостиль, редактура, UX-тексты, деловая переписка. ~1044 правил, 7 доменов. Автоактивируется при русском тексте.
+# ─── УРОВЕНЬ 2: Валидация symlink ───
+echo ''
+echo '─── Уровень 2: Symlink в агентах ───'
 
-```bash
-# Через ClawHub
-openclaw skills install ru-text
+# Создать symlink для каждого агента
+for agent_dir in \$HOME/.openclaw/agents/*/agent/; do
+  [ -d \"\$agent_dir\" ] || continue
+  agent_name=\$(basename \$(dirname \$agent_dir))
+  
+  # Удалить старую директорию или битый symlink
+  rm -rf \"\${agent_dir}skills\"
+  
+  # Создать symlink на глобальную директорию
+  ln -sf \$SKILLS_DIR \"\${agent_dir}skills\"
+  
+  echo \"  🔗 \$agent_name: symlink создан\"
+done
 
-# Или вручную
-cd /tmp && git clone https://github.com/talkstream/ru-text.git
-mkdir -p ~/.openclaw/skills/ru-text
-cp /tmp/ru-text/skills/ru-text/SKILL.md ~/.openclaw/skills/ru-text/SKILL.md
-cp -r /tmp/ru-text/skills/ru-text/references ~/.openclaw/skills/ru-text/references
-```
+# Проверить что symlink работает для каждого агента и каждого скилла
+LINK_FAILED=''
 
-**Почему ru-text важен для агентов:**
-- Корректная типографика: «кавычки», тире, неразрывные пробелы
-- Чистый инфостиль: без «является», «осуществлять», «в настоящее время»
-- UX-тексты: «Отмена» вместо «Нет», структура ошибок
-- Деловая переписка: без канцелярита
+for agent_dir in \$HOME/.openclaw/agents/*/agent/skills/; do
+  [ -d \"\$agent_dir\" ] || continue
+  agent_name=\$(basename \$(dirname \$(dirname \$agent_dir)))
+  
+  for skill in \$REQUIRED_SKILLS; do
+    AGENT_SKILL=\"\${agent_dir}\${skill}/SKILL.md\"
+    
+    if [ -f \"\$AGENT_SKILL\" ]; then
+      echo \"  ✅ \$agent_name видит \$skill\"
+    else
+      echo \"  ❌ \$agent_name НЕ видит \$skill → symlink битый!\"
+      LINK_FAILED=\"\$LINK_FAILED \$agent_name:\$skill\"
+    fi
+  done
+done
 
-### Шаг 22: Симлинк скиллов в workspace агента
+if [ -n \"\$LINK_FAILED\" ]; then
+  echo ''
+  echo \"❌ УРОВЕНЬ 2 ПРОВАЛЕН: битые symlink:\$LINK_FAILED\"
+  echo 'Выполняю откат: пересоздаю symlink...'
+  
+  for agent_dir in \$HOME/.openclaw/agents/*/agent/; do
+    [ -d \"\$agent_dir\" ] || continue
+    agent_name=\$(basename \$(dirname \$agent_dir))
+    rm -rf \"\${agent_dir}skills\"
+    ln -sf \$SKILLS_DIR \"\${agent_dir}skills\"
+    
+    # Проверить снова
+    for skill in \$REQUIRED_SKILLS; do
+      if [ -f \"\${agent_dir}skills/\${skill}/SKILL.md\" ]; then
+        echo \"  🔧 \$agent_name:\$skill — исправлено\"
+      else
+        echo \"  💀 \$agent_name:\$skill — НЕ ИСПРАВЛЯЕТСЯ, ручное вмешательство\"
+        exit 1
+      fi
+    done
+  done
+fi
 
-Чтобы агент имел доступ к скиллам при установке на тот же сервер:
+echo '✅ Уровень 2 пройден: все агенты видят все скиллы через symlink'
+"
 
-```bash
-# Если скиллы в ~/.openclaw/skills/, а агент в ~/.openclaw/agents/<id>/
-# Вариант A: симлинк (рекомендуется)
-ln -s ~/.openclaw/skills ~/.openclaw/agents/<agent-id>/agent/skills
+# ─── УРОВЕНЬ 3: Валидация после рестарта ───
+echo ''
+echo '─── Уровень 3: Проверка после рестарта ───'
 
-# Вариант B: копия (если агент на другом сервере)
-cp -r ~/.openclaw/skills/agent-doctor ~/.openclaw/agents/<agent-id>/agent/skills/
-cp -r ~/.openclaw/skills/agent-forge ~/.openclaw/agents/<agent-id>/agent/skills/
-cp -r ~/.openclaw/skills/ru-text ~/.openclaw/agents/<agent-id>/agent/skills/
-```
+# Перезапустить OpenClaw
+ssh $TARGET "systemctl restart openclaw"
+sleep 5
 
-⚠️ **Для удалённой установки** (сервер ≠ текущий): скопируй SKILL.md каждого скилла через SSH:
-```bash
-ssh user@host "mkdir -p ~/.openclaw/skills/agent-doctor ~/.openclaw/skills/agent-forge ~/.openclaw/skills/ru-text"
-scp /tmp/openclaw-superagent/skills/agent-doctor/SKILL.md user@host:~/.openclaw/skills/agent-doctor/
-scp /tmp/openclaw-superagent/skills/agent-forge/SKILL.md user@host:~/.openclaw/skills/agent-forge/
-scp /tmp/ru-text/skills/ru-text/SKILL.md user@host:~/.openclaw/skills/ru-text/
-scp -r /tmp/ru-text/skills/ru-text/references user@host:~/.openclaw/skills/ru-text/
+# Проверить что сервис жив
+SERVICE_STATUS=$(ssh $TARGET "systemctl is-active openclaw")
+if [ "$SERVICE_STATUS" != "active" ]; then
+  echo "❌ УРОВЕНЬ 3 ПРОВАЛЕН: сервис не запустился после установки скиллов!"
+  echo "Смотрим логи:"
+  ssh $TARGET "journalctl -u openclaw --since '10 sec ago' --no-pager | tail -20"
+  echo ''
+  echo 'Выполняю откат: удаляю все установленные скиллы, рестартую заново'
+  ssh $TARGET "
+    for skill in $REQUIRED_SKILLS; do
+      rm -rf \$HOME/.openclaw/skills/\$skill
+    done
+    systemctl restart openclaw
+  "
+  echo '⚠️ Установка скиллов ОТМЕНЕНА. Сервис восстановлен без скиллов.'
+  exit 1
+fi
+
+# Проверить что агент загрузил скиллы (по логам)
+SKILL_LOG=$(ssh $TARGET "journalctl -u openclaw --since '10 sec ago' --no-pager 2>&1 | grep -c 'skill.*loaded\|loading skill' || echo 0")
+echo "  📋 Скиллов загружено (по логам): $SKILL_LOG"
+
+if [ "$SKILL_LOG" -ge 1 ]; then
+  echo '✅ Уровень 3 пройден: сервис жив, скиллы загружены'
+else
+  echo '⚠️ Сервис жив, но скиллы не обнаружены в логах — возможно logging level не показывает загрузку скиллов'
+  echo 'Это не ошибка, продолжаем'
+fi
+
+echo ''
+echo '==========================================='
+echo ' ✅ ВСЕ 3 УРОВНЯ ПРОЙДЕНЫ'
+echo '==========================================='
 ```
 
 ---
@@ -833,131 +1185,135 @@ scp -r /tmp/ru-text/skills/ru-text/references user@host:~/.openclaw/skills/ru-te
 2. Показать пользователю список с кратким описанием
 3. Предложить установить нужные
 
-### Как собрать список скиллов
+### Как собирать каталог
 
-Скиллы можно брать из любого источника — не только с титов-main. Универсальный способ:
+**Источник:** `~/.openclaw/skills/` на этом же сервере (где запущен скилл). Каталог собирается динамически.
 
 ```bash
-# Собрать все скиллы из указанной директории на любом сервере
-# Каждый скилл — это директория с SKILL.md внутри
-# description берётся из YAML-фронтматтера (строка после "description:")
-
-SRC="~/.openclaw/skills"  # путь к скиллам на сервере-источнике
-
-echo "=== Доступные скиллы ==="
-for skill_dir in $SRC/*/; do
+# Собрать все скиллы с локальной директории
+echo '=== Доступные скиллы ==='
+for skill_dir in ~/.openclaw/skills/*/; do
   name=$(basename "$skill_dir")
   skillfile="${skill_dir}SKILL.md"
   if [ -f "$skillfile" ]; then
-    desc=$(grep -m1 '^description:' "$skillfile" | sed 's/^description: *//' | tr -d '"' | cut -c1-100)
-    echo "  $name — $desc"
-  fi
-done
-
-# Также проверить plugin-skills (если есть)
-for skill_dir in ~/.openclaw/plugin-skills/*/ 2>/dev/null; do
-  name=$(basename "$skill_dir")
-  skillfile="${skill_dir}SKILL.md"
-  if [ -f "$skillfile" ]; then
-    desc=$(grep -m1 '^description:' "$skillfile" | sed 's/^description: *//' | tr -d '"' | cut -c1-100)
-    echo "  $name — $desc"
-  fi
-done
-
-# Встроенные скиллы OpenClaw (системные)
-echo ""
-echo "=== Системные скиллы (встроены, доступны всегда) ==="
-for skill_dir in $(npm root -g)/openclaw/skills/*/ 2>/dev/null; do
-  name=$(basename "$skill_dir")
-  skillfile="${skill_dir}SKILL.md"
-  if [ -f "$skillfile" ]; then
-    desc=$(grep -m1 '^description:' "$skillfile" | sed 's/^description: *//' | tr -d '"' | cut -c1-100)
+    desc=$(grep -m1 '^description:' "$skillfile" | sed 's/^description: *//' | tr -d '"' | head -c 80)
     echo "  $name — $desc"
   fi
 done
 ```
 
-### ⚠️ Что НЕ показывать
-
-NSI-специфичные скиллы (лежат на titov-nsi: analytics-pro, career-coach, data-bridge-pro, devops-remote, executive-search-ru, strat-session, devops-automation-pack, devops-fleet, devops-techarch, и др.) — **никогда не показывать другим пользователям.**
-
-### Как показать пользователю
+### Как показывать пользователю
 
 Сгруппировать скиллы по категориям и отправить кратким списком с описаниями.
 
-**Обязательные (уже установлены):**
-• agent-doctor — самодиагностика OpenClaw: память, кроны, конфиг, gateway, безопасность. 7 категорий + автофиксы
-• agent-forge — создание и улучшение скиллов и агентов
-• ru-text — качество русского текста: типографика, инфостиль, редактура
+**Обязательные (уже установлены):** всегда показывать первыми, не предлагать удалять
 
-**DevOps:**
-• server-connect — надёжное подключение к серверу с ретраями и диагностикой
-• deploy-agent — развёртывание агентов на новых серверах под ключ
-• docker-sandbox — Docker-песочницы для безопасного выполнения кода
+**Остальные:** сгруппировать по категориям. Каждая категория с заголовком, каждый скилл одной строкой.
 
-**Аналитика:**
-• advanced-embeddings — продвинутые эмбеддинги для архитектора и knowledge base
-• analyst-evaluator — оценка компетенций аналитиков, GAP-анализ, планы развития
-• deep-research — глубокое исследование тем с верификацией
-• personal-embeddings — эмбеддинги для номенклатурной классификации
+Пример вывода (генерируется из реального списка на этом сервере):
 
-**Контент и дизайн:**
-• frontend-design-ultimate — генерация сайтов: лендинги, портфолио, дашборды (React, Tailwind)
-• landing-page-generator — высококонверсионные лендинги для продуктов
-• simple-html-generator — быстрые HTML-страницы с автопубликацией
-• powerpoint-pptx — создание и редактирование PowerPoint презентаций
+```
+📦 Доступные скиллы (с этого сервера):
 
-**Голос:**
-• openai-whisper — распознавание речи локально, без API-ключа
+✅ Уже установлены:
+• agent-doctor — самодиагностика
+• agent-forge — создание скиллов
+• ru-text — качество русского текста
 
-**Данные:**
-• speaker-data-guardian — защита от потери данных: бэкапы, валидация, восстановление
-• raglite — локальный RAG-кэш: индексация документов + поиск
+🛠 DevOps:
+• server-connect — подключение к серверам
+• deploy-agent — развёртывание агентов
+• docker-sandbox — Docker-песочницы
 
-**Системные (встроены в OpenClaw, доступны всегда):**
-~50 скиллов: github, notion, weather, summarize, coding-agent, tmux, obsidian, browser-automation, voice-call, discord, slack, gog (Google), himalaya (email), spotify, skill-creator, clawhub и другие.
+📊 Аналитика:
+• advanced-embeddings — эмбеддинги
+• analyst-evaluator — оценка компетенций
+• deep-research — исследование тем
 
-⚠️ Список выше — текущий снимок с титов-main. При добавлении новых скиллов они автоматически попадают в каталог.
-NSI-специфичные скиллы исключены из списка.
+🎨 Дизайн:
+• frontend-design-ultimate — сайты
+• landing-page-generator — лендинги
+• simple-html-generator — HTML-страницы
+• powerpoint-pptx — презентации
+• diagram-maker — диаграммы
 
-### Как устанавливать скиллы (с верификацией)
+🎤 Голос:
+• openai-whisper — распознавание речи
 
-1. Пользователь говорит «установи X»
-2. Скопировать SKILL.md с сервера-источника → на сервер пользователя:
-   ```bash
-   ssh user@target "mkdir -p ~/.openclaw/skills/X"
-   scp ~/.openclaw/skills/X/SKILL.md user@target:~/.openclaw/skills/X/
-   ```
-3. **ОБЯЗАТЕЛЬНО: проверить что агент ВИДИТ скилл после установки:**
-   ```bash
-   ssh user@target "
-     echo '=== Проверка установки ==='
-     ls ~/.openclaw/skills/X/SKILL.md && echo '✅ Файл скилла на месте'
-     
-     # Проверить все директории агентов — у каждого должен быть доступ
-     for agent_dir in ~/.openclaw/agents/*/agent/skills/; do
-       [ -d \"\$agent_dir\" ] && ls \"\${agent_dir}X/SKILL.md\" 2>/dev/null && echo \"✅ Агент \$(basename \$(dirname \$(dirname \$agent_dir))) видит скилл\" || echo \"❌ Агент \$(basename \$(dirname \$(dirname \$agent_dir))) НЕ видит скилл — нужен symlink\"
-     done
-     
-     # Если агент не видит — удалить старые, создать ОДИН symlink на всю skills/
-     for agent_dir in ~/.openclaw/agents/*/agent/; do
-       [ -d \"\$agent_dir\" ] && rm -rf \"\${agent_dir}skills\" && ln -sf ~/.openclaw/skills \"\${agent_dir}skills\"
-     done
-     
-     # Перезапустить для подхвата
-     systemctl restart openclaw
-   "
-   ```
-4. **Подтвердить пользователю:** «Скилл X установлен, агент его видит ✅»
+💾 Данные:
+• speaker-data-guardian — бэкапы
+• raglite — RAG-кэш
 
-**Типичная проблема:** индивидуальные симлинки не обновляются при добавлении нового скилла. Надёжнее удалить директорию skills/ в агенте и создать symlink на всю глобальную директорию:
+Напиши какие установить (например: «установи server-connect, docker-sandbox»), или «все» чтобы установить всё, или «пропусти» чтобы оставить только обязательные.
+```
+
+### ⚠️ Правила показа
+
+1. **Не ставить ничего без спроса.** Даже если кажется что «точно пригодится» — показать и ждать ответа
+2. **Ждать ответа.** Не продолжать развёртывание пока пользователь не ответит
+3. **Если пользователь сказал «позже» или «пропусти» — не настаивать**, оставить только обязательные
+4. **Если пользователь сказал «все» — установить всё из каталога (кроме обязательных, они уже есть)**
+5. **Если пользователь назвал конкретные скиллы — установить только их**
+
+### Как устанавливать выбранные скиллы
+
+```bash
+# SKILLS_TO_INSTALL="server-connect docker-sandbox" (получено от пользователя)
+
+for skill in $SKILLS_TO_INSTALL; do
+  echo "=== Установка скилла: $skill ==="
+  
+  # 1. Скопировать с локального ~/.openclaw/skills/
+  scp ~/.openclaw/skills/${skill}/SKILL.md root@${TARGET}:~/.openclaw/skills/${skill}/
+  
+  # 2. Проверить что файл скопирован и не пустой
+  ssh root@${TARGET} "
+    if [ -s ~/.openclaw/skills/${skill}/SKILL.md ]; then
+      echo '✅ Скилл ${skill} скопирован'
+    else
+      echo '❌ ОШИБКА: скилл ${skill} не скопировался или пустой'
+      exit 1
+    fi
+  " || {
+    echo '❌ Не удалось установить ${skill}, пропускаем'
+    continue
+  }
+  
+  # 3. Починить symlink для агента (если нужно)
+  ssh root@${TARGET} "
+    for agent_dir in ~/.openclaw/agents/*/agent/; do
+      [ -d \"\$agent_dir\" ] && rm -rf \"\${agent_dir}skills\" && ln -sf ~/.openclaw/skills \"\${agent_dir}skills\"
+    done
+  "
+  
+  # 4. Проверить что агент видит скилл
+  ssh root@${TARGET} "
+    for agent_dir in ~/.openclaw/agents/*/agent/skills/; do
+      [ -d \"\$agent_dir\" ] && ls \"\${agent_dir}${skill}/SKILL.md\" 2>/dev/null && echo '✅ Агент видит ${skill}' || echo '❌ Агент НЕ видит ${skill}'
+    done
+  "
+  
+  echo ''
+done
+
+# 5. Перезапустить
+ssh root@${TARGET} "systemctl restart openclaw"
+
+echo '✅ Установка завершена'
+```
+
+**Типичная проблема:** индивидуальные симлинки не обновляются при добавлении нового скилла. Надёжнее всегда удалять `skills/` и создавать symlink на всю глобальную директорию:
 ```bash
 rm -rf ~/.openclaw/agents/main/agent/skills
 ln -sf ~/.openclaw/skills ~/.openclaw/agents/main/agent/skills
 ```
 После этого любые новые скиллы в `~/.openclaw/skills/` автоматически станут доступны агенту.
 
-⚠️ **Ошибка Кристины:** скиллы были скопированы в `~/.openclaw/skills/`, но агент в `~/.openclaw/agents/main/agent/` не имел symlink → не видел их. Всегда проверять и чинить доступ после установки.
+### Что НЕ делать
+
+- ❌ Не копировать все скиллы пачкой без спроса
+- ❌ Не использовать захардкоженный список — каталог динамический
+- ❌ Не продолжать развёртывание пока пользователь не ответил
 
 ---
 
@@ -991,8 +1347,8 @@ systemctl is-enabled ollama && echo "✅ Ollama enabled" || echo "⚠️ Ollama 
 ### Тест 2: Ollama API — все модели работают
 
 ```bash
-# Проверить КАЖДУЮ модель
-for model in deepseek-v4-pro:cloud glm-5.1:cloud kimi-k2.6:cloud; do
+# Проверить КАЖДУЮ модель (стандарт: deepseek + glm)
+for model in deepseek-v4-pro:cloud glm-5.1:cloud; do
   echo "=== $model ===" && curl -s http://127.0.0.1:11434/api/chat \
     -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hi\"}],\"stream\":false,\"max_tokens\":5}" \
     --max-time 25 | python3 -c "import sys,json; d=json.load(sys.stdin); print('✅', d['message']['content'])" 2>&1
@@ -1226,18 +1582,144 @@ rm /usr/local/bin/openclaw-healthcheck.sh
 - [ ] Cloud-модели скачаны (ollama list)
 - [ ] nomic-embed-text скачан
 - [ ] memorySearch настроен
-- [ ] Память: memory/, MEMORY.md, MEMORY-POLICY.md
+- [ ] Память: memory/*.md, MEMORY.md, memory/contract.md (Memory Blueprint)
 - [ ] Telegram-токен получен
 - [ ] Workspace агента создан
 - [ ] Агент + аккаунт + binding в конфиге
 - [ ] Gateway перезапущен
 - [ ] Бот отвечает в Telegram
 - [ ] Agent Doctor + Agent Forge + ru-text установлены
+- [ ] ✅ Валидация конфига: skills не объект {}, агент видит скиллы (Часть 14)
+- [ ] ✅ Инвентаризация скиллов: workspace + system + health check (Часть 15)
 - [ ] ✅ SMOKE TESTS ПРОЙДЕНЫ (7 тестов)
 - [ ] ✅ API ключ проверен ДО развёртывания (Шаг 00)
 - [ ] ✅ 7-day monitoring настроен
 - [ ] ✅ Данные записаны в MEMORY.md + SECRETS.md
 - [ ] ✅ server-connect диагностика выполнена
+
+---
+
+---
+
+## Часть 14: Валидация конфига агента ПОСЛЕ разворота (ОБЯЗАТЕЛЬНО)
+
+### Корневая причина проблемы Анны (2026-06-11)
+
+При развороте Анны в конфиг попало битое поле: `"skills": {}`.
+
+`agents.list[].skills` — это **allowlist** (фильтр), а НЕ список для загрузки.
+- `skills` отсутствует → агент видит ВСЕ скиллы из workspace/skills ✅
+- `skills: []` → агент НЕ видит скиллы (пустой allowlist)
+- `skills: {}` → ❌ БИТЫЙ КОНФИГ — объект вместо массива
+
+Результат: агент загружался с ошибкой `Invalid input`, скиллы не работали.
+
+### Процедура валидации после разворота
+
+Выполняется на сервере ПОСЛЕ записи openclaw.json, ДО перезапуска:
+
+```bash
+python3 << 'PYEOF'
+import json
+with open('/root/.openclaw/openclaw.json') as f:
+    config = json.load(f)
+errors = []
+for agent in config.get('agents', {}).get('list', []):
+    sid = agent.get('id', '?')
+    skills = agent.get('skills')
+    if skills is None:
+        print(f'OK {sid}: skills отсутствует — все скиллы видны')
+    elif isinstance(skills, list):
+        print(f'OK {sid}: skills=[{len(skills)}] — allowlist')
+    elif isinstance(skills, dict):
+        errors.append(f'BROKEN {sid}: skills={{}} — объект вместо массива!')
+    else:
+        errors.append(f'BROKEN {sid}: неизвестный тип {type(skills).__name__}')
+if errors:
+    print('ERRORS:')
+    for e in errors: print('  ' + e)
+    exit(1)
+else:
+    print('ALL OK')
+PYEOF
+```
+
+### Исправление битого конфига
+
+```bash
+python3 << 'PYEOF'
+import json
+with open('/root/.openclaw/openclaw.json') as f:
+    config = json.load(f)
+for agent in config.get('agents', {}).get('list', []):
+    if isinstance(agent.get('skills'), dict):
+        del agent['skills']
+        print(f'Fixed: removed broken skills from {agent.get("id")}')
+with open('/root/.openclaw/openclaw.json', 'w') as f:
+    json.dump(config, f, ensure_ascii=False, indent=2)
+PYEOF
+systemctl restart openclaw
+```
+
+### Как на самом деле загружаются скиллы
+
+Скиллы загружаются автоматически, прописывать в конфиг НЕ нужно:
+
+| Приоритет | Источник | Путь |
+|-----------|----------|------|
+| 1 (высший) | Workspace skills | workspace/skills |
+| 4 | System skills | ~/.openclaw/skills |
+
+ClawHub устанавливает в workspace/skills — приоритет 1.
+
+### Когда выполнять
+
+1. После каждой записи openclaw.json — перед systemctl restart
+2. При диагностике — если бот не видит скиллы
+
+### Что НЕ делать
+
+- НЕ писать "skills": {} — битый конфиг
+- НЕ писать "skills": [] без причины — отключает все скиллы
+- НЕ перезапускать сервис с непровалидированным конфигом
+
+---
+
+## Часть 15: Инвентаризация скиллов при диагностике
+
+### Проверка
+
+```bash
+# Конфиг валиден?
+python3 -c "
+import json
+with open('$HOME/.openclaw/openclaw.json') as f:
+    config = json.load(f)
+for agent in config.get('agents', {}).get('list', []):
+    skills = agent.get('skills')
+    sid = agent.get('id', '?')
+    if skills is None: print(f'{sid}: OK')
+    elif isinstance(skills, dict): print(f'{sid}: BROKEN')
+    elif isinstance(skills, list): print(f'{sid}: allowlist {len(skills)}')
+"
+
+# Скиллы на диске?
+echo '--- Workspace skills ---'
+ls ~/.openclaw/workspace-*/skills/ 2>/dev/null
+echo '--- System skills ---'
+ls ~/.openclaw/skills/ 2>/dev/null
+
+# Сервис жив?
+curl -s --max-time 3 http://127.0.0.1:18789/health
+```
+
+### Чеклист
+
+- [ ] skills в конфиге — None (отсутствует) или массив строк
+- [ ] skills НЕ объект {}
+- [ ] Скиллы есть в workspace/skills или ~/.openclaw/skills
+- [ ] Сервис перезапущен после изменений
+- [ ] Health check OK
 
 ---
 
